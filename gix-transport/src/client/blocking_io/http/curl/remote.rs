@@ -520,7 +520,40 @@ pub fn new() -> Worker {
             });
             handle.http_headers(headers)?;
 
-            if let Err(err) = handle.perform() {
+            // Time the transfer from the only place that can: this worker owns
+            // the libcurl handle. `perform()` blocks for the whole request, and
+            // pipe back-pressure couples its completion to the caller draining
+            // the response, so the span is the true request window. CURLINFO
+            // then gives curl's own TTFB/total/sizes — no byte-stream inference.
+            let perform_result = {
+                let _span = tracing::info_span!(
+                    target: "gix_http",
+                    "http request",
+                    method = if upload_body_kind.is_some() { "POST" } else { "GET" },
+                    url = %effective_url,
+                    ttfb_ms = tracing::field::Empty,
+                    total_ms = tracing::field::Empty,
+                    down_bytes = tracing::field::Empty,
+                    up_bytes = tracing::field::Empty,
+                )
+                .entered();
+                let result = handle.perform();
+                if let Ok(d) = handle.starttransfer_time() {
+                    _span.record("ttfb_ms", u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                }
+                if let Ok(d) = handle.total_time() {
+                    _span.record("total_ms", u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                }
+                if let Ok(b) = handle.download_size() {
+                    _span.record("down_bytes", b as u64);
+                }
+                if let Ok(b) = handle.upload_size() {
+                    _span.record("up_bytes", b as u64);
+                }
+                result
+            };
+
+            if let Err(err) = perform_result {
                 let handler = handle.get_mut();
                 handler.reset();
 
