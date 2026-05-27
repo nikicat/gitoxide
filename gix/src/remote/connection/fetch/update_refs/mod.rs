@@ -71,7 +71,11 @@ pub(crate) fn update(
     dry_run: fetch::DryRun,
     write_packed_refs: fetch::WritePackedRefs,
 ) -> Result<update::Outcome, update::Error> {
-    let _span = gix_trace::detail!("update_refs()", mappings = mappings.len());
+    // `find_ms` is the per-mapping local-ref resolution (the packed-snapshot fast path below);
+    // `ff_ms` is the fast-forward ancestry walk, which only runs for the few refs that changed.
+    let span = gix_trace::detail!("update_refs()", mappings = mappings.len(), find_ms = 0u64, ff_ms = 0u64);
+    let mut find_time = std::time::Duration::ZERO;
+    let mut ff_time = std::time::Duration::ZERO;
     let mut edits = Vec::new();
     let mut updates = Vec::new();
     let mut edit_indices_to_validate = Vec::new();
@@ -80,6 +84,27 @@ pub(crate) fn update(
     let implicit_tag_refspec = fetch_tags
         .to_refspec()
         .filter(|_| matches!(fetch_tags, crate::remote::fetch::Tags::Included));
+
+    // Resolving each mapping's local tracking ref via `try_find_reference` probes the loose ref
+    // file on disk *before* packed-refs, i.e. one wasted `open()` syscall per ref on a freshly
+    // packed mirror (the AUR mirror has ~155k mappings, where this dominated `find_ms`). Mirror
+    // the negotiate-side fast path (see gix-protocol `mark_all_refs_in_repo`): snapshot packed-refs
+    // and the set of loose ref names once, then resolve packed-only names straight from the
+    // snapshot via `try_find_packed_only`. Names that are actually loose still take the full
+    // loose-first lookup, preserving precedence; if either snapshot is unavailable we fall back to
+    // `try_find_reference` for everything (correctness over speed).
+    //
+    // Enumerating the loose names walks the entire `refs/` tree, so it only pays off when there
+    // are enough mappings to amortize the walk: a small fetch into a repository with many loose
+    // refs would otherwise trade O(mapped refs) probes for an O(all loose refs) scan. Below the
+    // threshold every name takes the plain `try_find_reference` path, exactly as before.
+    const MIN_MAPPINGS_FOR_LOOSE_NAME_SNAPSHOT: usize = 256;
+    let packed_snapshot = repo.refs.cached_packed_buffer().ok().flatten();
+    let packed = packed_snapshot.as_ref().map(|b| &***b);
+    let loose_names: Option<std::collections::HashSet<gix_ref::bstr::BString>> = packed
+        .filter(|_| mappings.len() >= MIN_MAPPINGS_FOR_LOOSE_NAME_SNAPSHOT)
+        .and(repo.refs.loose_iter().ok())
+        .map(|iter| iter.filter_map(Result::ok).map(|r| r.name.into()).collect());
     for (remote, local, spec, is_implicit_tag) in mappings.iter().filter_map(
         |fetch::refmap::Mapping {
              remote,
@@ -113,7 +138,17 @@ pub(crate) fn update(
         }
         let (mode, edit_index, type_change) = match local {
             Some(name) => {
-                let (mode, reflog_message, name, previous_value) = match repo.try_find_reference(name)? {
+                let find_start = std::time::Instant::now();
+                let found = match (&loose_names, packed) {
+                    (Some(loose), Some(packed)) if !loose.contains(name) => repo
+                        .refs
+                        .try_find_packed_only(name, Some(packed))
+                        .map_err(crate::reference::find::Error::from)?
+                        .map(|r| crate::Reference::from_ref(r, repo)),
+                    _ => repo.try_find_reference(name)?,
+                };
+                find_time += find_start.elapsed();
+                let (mode, reflog_message, name, previous_value) = match found {
                     Some(existing) => {
                         if let Some(wt_dirs) = checked_out_branches.get_mut(existing.name()) {
                             wt_dirs.sort();
@@ -151,6 +186,7 @@ pub(crate) fn update(
                                     }
                                 } else {
                                     let mut force = spec.allow_non_fast_forward();
+                                    let ff_start = std::time::Instant::now();
                                     let is_fast_forward = match dry_run {
                                         fetch::DryRun::No => {
                                             let ancestors = repo
@@ -182,6 +218,7 @@ pub(crate) fn update(
                                         }
                                         fetch::DryRun::Yes => true,
                                     };
+                                    ff_time += ff_start.elapsed();
                                     if is_fast_forward {
                                         (
                                             Mode::FastForward,
@@ -288,6 +325,9 @@ pub(crate) fn update(
             edit_index,
         });
     }
+
+    span.record("find_ms", u64::try_from(find_time.as_millis()).unwrap_or(u64::MAX))
+        .record("ff_ms", u64::try_from(ff_time.as_millis()).unwrap_or(u64::MAX));
 
     for (update_index, edit_index) in edit_indices_to_validate {
         let edit = &edits[edit_index];
