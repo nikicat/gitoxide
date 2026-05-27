@@ -425,10 +425,65 @@ fn mark_all_refs_in_repo(
     queue: &mut Queue,
     mark: Flags,
 ) -> Result<(), Error> {
-    let _span = gix_trace::detail!("mark_all_refs");
-    for local_ref in store.iter()?.all()? {
+    let span = gix_trace::detail!(
+        "mark_all_refs",
+        refs = 0u64,
+        peeled = 0u64,
+        iter_ms = 0u64,
+        peel_ms = 0u64,
+        insert_ms = 0u64
+    );
+    let packed = store.cached_packed_buffer()?;
+    let packed = packed.as_ref().map(|b| &***b);
+    let mut iter_time = std::time::Duration::ZERO;
+    let mut peel_time = std::time::Duration::ZERO;
+    let mut insert_time = std::time::Duration::ZERO;
+    let mut count = 0u64;
+    let mut peeled = 0u64;
+    let mut iter_start = std::time::Instant::now();
+    let platform = store.iter()?;
+    for local_ref in platform.all()? {
+        iter_time += iter_start.elapsed();
+        count += 1;
         let mut local_ref = local_ref?;
-        let id = local_ref.peel_to_id_packed(store, objects, store.cached_packed_buffer()?.as_ref().map(|b| &***b))?;
+
+        // Resolve the ref to a commit id, preferring the commit-graph over a full
+        // object inflate. A ref that points *directly* at a commit (every
+        // lightweight branch — the bulk of refs) is confirmed via the graph's
+        // mmap'd lookup inside `get_or_insert_commit` without ever touching the
+        // ODB. `peel_to_id_packed` would instead `try_find` (inflate) the object
+        // just to check it isn't an annotated tag, which on a many-ref repo (the
+        // AUR mirror has ~155k) is the dominant cost of this function. Only refs
+        // that aren't a known commit — annotated tags (peeled below) and symbolic
+        // refs — take the slow path.
+        let insert_start = std::time::Instant::now();
+        if let Some(id) = local_ref.target.try_id().map(ToOwned::to_owned) {
+            let mut is_complete = false;
+            // `Some` ⇒ `id` is a commit (from the graph, or the ODB on a graph
+            // miss); `None` ⇒ not a commit, i.e. an annotated tag to peel.
+            if let Some(commit) = graph.get_or_insert_commit(id, |md| {
+                is_complete = md.flags.contains(Flags::COMPLETE);
+                md.flags |= mark;
+            })? {
+                if !is_complete {
+                    queue.insert(commit.commit_time, id);
+                }
+                insert_time += insert_start.elapsed();
+                iter_start = std::time::Instant::now();
+                continue;
+            }
+        }
+        insert_time += insert_start.elapsed();
+
+        // Slow path: peel an annotated tag down to its commit, or follow a
+        // symbolic ref. Packed tags carry the `^`-peeled id, so even this usually
+        // avoids an inflate.
+        peeled += 1;
+        let peel_start = std::time::Instant::now();
+        let id = local_ref.peel_to_id_packed(store, objects, packed)?;
+        peel_time += peel_start.elapsed();
+
+        let insert_start = std::time::Instant::now();
         let mut is_complete = false;
         if let Some(commit) = graph
             .get_or_insert_commit(id, |md| {
@@ -439,7 +494,14 @@ fn mark_all_refs_in_repo(
         {
             queue.insert(commit.commit_time, id);
         }
+        insert_time += insert_start.elapsed();
+        iter_start = std::time::Instant::now();
     }
+    span.record("refs", count)
+        .record("peeled", peeled)
+        .record("iter_ms", u64::try_from(iter_time.as_millis()).unwrap_or(u64::MAX))
+        .record("peel_ms", u64::try_from(peel_time.as_millis()).unwrap_or(u64::MAX))
+        .record("insert_ms", u64::try_from(insert_time.as_millis()).unwrap_or(u64::MAX));
     Ok(())
 }
 
