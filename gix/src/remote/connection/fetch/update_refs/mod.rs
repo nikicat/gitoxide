@@ -73,8 +73,15 @@ pub(crate) fn update(
 ) -> Result<update::Outcome, update::Error> {
     // `find_ms` is the per-mapping local-ref resolution (the packed-snapshot fast path below);
     // `ff_ms` is the fast-forward ancestry walk, which only runs for the few refs that changed.
-    let span = gix_trace::detail!("update_refs()", mappings = mappings.len(), find_ms = 0u64, ff_ms = 0u64);
+    let span = gix_trace::detail!(
+        "update_refs()",
+        mappings = mappings.len(),
+        find_ms = 0u64,
+        exists_ms = 0u64,
+        ff_ms = 0u64
+    );
     let mut find_time = std::time::Duration::ZERO;
+    let mut exists_time = std::time::Duration::ZERO;
     let mut ff_time = std::time::Duration::ZERO;
     let mut edits = Vec::new();
     let mut updates = Vec::new();
@@ -123,7 +130,63 @@ pub(crate) fn update(
     ) {
         // `None` only if unborn.
         let remote_id = remote.as_id();
-        if matches!(dry_run, fetch::DryRun::No) && !remote_id.is_none_or(|id| repo.objects.exists(id)) {
+
+        // Fast path for the dominant case on a large mirror: an unchanged, direct, packed-only
+        // tracking ref. Resolve the local ref straight from the packed snapshot with a borrowed,
+        // allocation-free lookup; if it is a direct ref already at `remote_id` the update is a
+        // guaranteed `NoChangeNeeded`, and we can emit its no-op edit without probing the ODB for
+        // the remote object (it is our current target, so it exists by definition), peeling, or
+        // running the fast-forward walk. The edit is byte-identical to what the full path below
+        // produces for this case. Symbolic/unborn remotes, loose refs, and any actual change fall
+        // through to the full path.
+        if let (Some(name), Some(remote_id), Some(loose), Some(packed)) = (local, remote_id, &loose_names, packed) {
+            let is_direct_remote = !matches!(
+                remote,
+                Source::Ref(
+                    gix_protocol::handshake::Ref::Symbolic { .. } | gix_protocol::handshake::Ref::Unborn { .. }
+                )
+            );
+            if is_direct_remote && !loose.contains(name) {
+                let find_start = std::time::Instant::now();
+                let existing = packed
+                    .try_find(name)
+                    .map_err(gix_ref::file::find::Error::from)
+                    .map_err(crate::reference::find::Error::from)?;
+                let unchanged = existing.as_ref().is_some_and(|e| e.target() == remote_id);
+                find_time += find_start.elapsed();
+                if let Some(existing) = existing.filter(|_| unchanged) {
+                    if !checked_out_branches.contains_key(existing.name) {
+                        let target = Target::Object(remote_id.to_owned());
+                        let edit_index = edits.len();
+                        edits.push(RefEdit {
+                            change: Change::Update {
+                                log: LogChange {
+                                    mode: RefLog::AndReference,
+                                    force_create_reflog: false,
+                                    message: message.compose("no update will be performed"),
+                                },
+                                expected: PreviousValue::MustExistAndMatch(target.clone()),
+                                new: target,
+                            },
+                            name: existing.name.to_owned(),
+                            deref: false,
+                        });
+                        updates.push(Update {
+                            mode: Mode::NoChangeNeeded,
+                            type_change: None,
+                            edit_index: Some(edit_index),
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let exists_start = std::time::Instant::now();
+        let remote_missing =
+            matches!(dry_run, fetch::DryRun::No) && !remote_id.is_none_or(|id| repo.objects.exists(id));
+        exists_time += exists_start.elapsed();
+        if remote_missing {
             if let Some(remote_id) = remote_id.filter(|id| !repo.objects.exists(id)) {
                 let update = if is_implicit_tag {
                     Mode::ImplicitTagNotSentByRemote.into()
@@ -327,6 +390,7 @@ pub(crate) fn update(
     }
 
     span.record("find_ms", u64::try_from(find_time.as_millis()).unwrap_or(u64::MAX))
+        .record("exists_ms", u64::try_from(exists_time.as_millis()).unwrap_or(u64::MAX))
         .record("ff_ms", u64::try_from(ff_time.as_millis()).unwrap_or(u64::MAX));
 
     for (update_index, edit_index) in edit_indices_to_validate {
