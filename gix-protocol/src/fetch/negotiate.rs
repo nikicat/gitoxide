@@ -159,13 +159,61 @@ where
     let mut remote_ref_target_known: Vec<bool> = std::iter::repeat_n(false, ref_map.mappings.len()).collect();
     let mut remote_ref_included: Vec<bool> = std::iter::repeat_n(false, ref_map.mappings.len()).collect();
 
+    // The `have`-set lookups below are the dominant cost of this function on repos with very many
+    // refs (the AUR mirror has ~155k mappings): for each mapping we resolve the local ref to an id,
+    // then load its commit. `Store::find` probes the loose ref file on disk *before* consulting
+    // packed-refs, so on a freshly-packed mirror that is one wasted `open()` syscall per ref. To
+    // avoid it we snapshot packed-refs once and the set of loose ref names once, then resolve
+    // packed-only names straight from the snapshot via `try_find_packed_only`. Names that are
+    // actually loose still go through `find`, preserving loose-over-packed precedence; if either
+    // snapshot is unavailable we fall back to `find` for everything (correctness over speed). The
+    // `find_ms` / `commit_ms` span fields split the two phases so the win is measurable.
+    //
+    // Enumerating the loose names walks the entire `refs/` tree, so it only pays off when there
+    // are enough mappings to amortize the walk: a small fetch into a repository with many loose
+    // refs would otherwise trade O(mapped refs) probes for an O(all loose refs) scan. Below the
+    // threshold every name takes the plain `find` path, exactly as before.
+    const MIN_MAPPINGS_FOR_LOOSE_NAME_SNAPSHOT: usize = 256;
+    let packed_snapshot = refs.cached_packed_buffer().ok().flatten();
+    let packed = packed_snapshot.as_ref().map(|b| &***b);
+    let loose_names: Option<std::collections::HashSet<bstr::BString>> = packed
+        .filter(|_| ref_map.mappings.len() >= MIN_MAPPINGS_FOR_LOOSE_NAME_SNAPSHOT)
+        .and(refs.loose_iter().ok())
+        .map(|iter| iter.filter_map(Result::ok).map(|r| r.name.into()).collect());
+
+    let mappings_span = gix_trace::detail!(
+        "mark mappings",
+        mappings = ref_map.mappings.len(),
+        find_ms = 0u64,
+        commit_ms = 0u64
+    );
+    let mut find_time = std::time::Duration::ZERO;
+    let mut commit_time = std::time::Duration::ZERO;
     for (mapping_idx, mapping) in ref_map.mappings.iter().enumerate() {
         let want_id = mapping.remote.as_id();
+        let find_start = std::time::Instant::now();
         let have_id = mapping.local.as_ref().and_then(|name| {
             // this is the only time git uses the peer-id.
-            let r = refs.find(name).ok()?;
-            r.target.try_id().map(ToOwned::to_owned)
+            match (&loose_names, packed) {
+                // Packed-only ref: a borrowed lookup straight from the buffer skips both the
+                // loose-ref `open()` syscall *and* the per-ref owned-`Reference` allocation that
+                // `try_find_packed_only` performs — the latter dominated `find_ms` on a large
+                // mirror. Packed refs are always direct, so `target()` is the id we want.
+                (Some(loose), Some(packed)) if !loose.contains(name) => {
+                    packed.try_find(name).ok().flatten().map(|r| r.target())
+                }
+                // A loose ref (or the fast path being unavailable): use the full lookup that
+                // honors loose-over-packed precedence.
+                _ => refs
+                    .try_find(name)
+                    .ok()
+                    .flatten()?
+                    .target
+                    .try_id()
+                    .map(ToOwned::to_owned),
+            }
         });
+        find_time += find_start.elapsed();
 
         // Even for ignored mappings we want to know if the `want` is already present locally, so skip nothing else.
         if !mapping_is_ignored(mapping) {
@@ -176,6 +224,7 @@ where
             }
         }
 
+        let commit_start = std::time::Instant::now();
         if let Some(commit) = want_id
             .and_then(|id| graph.get_or_insert_commit(id.into(), |_| {}).transpose())
             .transpose()?
@@ -185,7 +234,13 @@ where
         } else if want_id.is_some_and(|maybe_annotated_tag| objects.exists(maybe_annotated_tag)) {
             remote_ref_target_known[mapping_idx] = true;
         }
+        commit_time += commit_start.elapsed();
     }
+    mappings_span
+        .record("find_ms", u64::try_from(find_time.as_millis()).unwrap_or(u64::MAX))
+        .record("commit_ms", u64::try_from(commit_time.as_millis()).unwrap_or(u64::MAX));
+    #[allow(clippy::drop_non_drop)] // needed when the `tracing` feature is disabled
+    drop(mappings_span);
 
     if matches!(shallow, Shallow::NoChange) {
         if num_mappings_with_change == 0 {
@@ -370,10 +425,65 @@ fn mark_all_refs_in_repo(
     queue: &mut Queue,
     mark: Flags,
 ) -> Result<(), Error> {
-    let _span = gix_trace::detail!("mark_all_refs");
-    for local_ref in store.iter()?.all()? {
+    let span = gix_trace::detail!(
+        "mark_all_refs",
+        refs = 0u64,
+        peeled = 0u64,
+        iter_ms = 0u64,
+        peel_ms = 0u64,
+        insert_ms = 0u64
+    );
+    let packed = store.cached_packed_buffer()?;
+    let packed = packed.as_ref().map(|b| &***b);
+    let mut iter_time = std::time::Duration::ZERO;
+    let mut peel_time = std::time::Duration::ZERO;
+    let mut insert_time = std::time::Duration::ZERO;
+    let mut count = 0u64;
+    let mut peeled = 0u64;
+    let mut iter_start = std::time::Instant::now();
+    let platform = store.iter()?;
+    for local_ref in platform.all()? {
+        iter_time += iter_start.elapsed();
+        count += 1;
         let mut local_ref = local_ref?;
-        let id = local_ref.peel_to_id_packed(store, objects, store.cached_packed_buffer()?.as_ref().map(|b| &***b))?;
+
+        // Resolve the ref to a commit id, preferring the commit-graph over a full
+        // object inflate. A ref that points *directly* at a commit (every
+        // lightweight branch — the bulk of refs) is confirmed via the graph's
+        // mmap'd lookup inside `get_or_insert_commit` without ever touching the
+        // ODB. `peel_to_id_packed` would instead `try_find` (inflate) the object
+        // just to check it isn't an annotated tag, which on a many-ref repo (the
+        // AUR mirror has ~155k) is the dominant cost of this function. Only refs
+        // that aren't a known commit — annotated tags (peeled below) and symbolic
+        // refs — take the slow path.
+        let insert_start = std::time::Instant::now();
+        if let Some(id) = local_ref.target.try_id().map(ToOwned::to_owned) {
+            let mut is_complete = false;
+            // `Some` ⇒ `id` is a commit (from the graph, or the ODB on a graph
+            // miss); `None` ⇒ not a commit, i.e. an annotated tag to peel.
+            if let Some(commit) = graph.get_or_insert_commit(id, |md| {
+                is_complete = md.flags.contains(Flags::COMPLETE);
+                md.flags |= mark;
+            })? {
+                if !is_complete {
+                    queue.insert(commit.commit_time, id);
+                }
+                insert_time += insert_start.elapsed();
+                iter_start = std::time::Instant::now();
+                continue;
+            }
+        }
+        insert_time += insert_start.elapsed();
+
+        // Slow path: peel an annotated tag down to its commit, or follow a
+        // symbolic ref. Packed tags carry the `^`-peeled id, so even this usually
+        // avoids an inflate.
+        peeled += 1;
+        let peel_start = std::time::Instant::now();
+        let id = local_ref.peel_to_id_packed(store, objects, packed)?;
+        peel_time += peel_start.elapsed();
+
+        let insert_start = std::time::Instant::now();
         let mut is_complete = false;
         if let Some(commit) = graph
             .get_or_insert_commit(id, |md| {
@@ -384,7 +494,14 @@ fn mark_all_refs_in_repo(
         {
             queue.insert(commit.commit_time, id);
         }
+        insert_time += insert_start.elapsed();
+        iter_start = std::time::Instant::now();
     }
+    span.record("refs", count)
+        .record("peeled", peeled)
+        .record("iter_ms", u64::try_from(iter_time.as_millis()).unwrap_or(u64::MAX))
+        .record("peel_ms", u64::try_from(peel_time.as_millis()).unwrap_or(u64::MAX))
+        .record("insert_ms", u64::try_from(insert_time.as_millis()).unwrap_or(u64::MAX));
     Ok(())
 }
 
