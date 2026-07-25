@@ -199,8 +199,11 @@ pub struct Options {
     /// figures. Only the curl backend honors it.
     pub download_progress: Option<Arc<AtomicU64>>,
     /// If set, the backend polls this flag while a request is in flight and
-    /// aborts the transfer as soon as it reads `true`, surfacing the request as
-    /// an [`std::io::ErrorKind::Interrupted`] I/O error. Unlike the
+    /// aborts the transfer as soon as it reads `true`, failing the request with
+    /// an I/O error whose message starts with `Interrupted:`. The kind is
+    /// [`std::io::ErrorKind::Other`], not `Interrupted`, as the latter is
+    /// retried by `read_exact()` and `read_until()` and would thus be swallowed
+    /// on the way to the caller. Unlike the
     /// operation-level `should_interrupt` threaded through the fetch (checked
     /// between reads by the protocol layer), this reaches time the transport
     /// spends *blocked* — e.g. waiting on an idle or slow socket — so a caller
