@@ -3,7 +3,7 @@ use std::{
     borrow::Cow,
     io::{BufRead, Read},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 use base64::Engine;
@@ -198,6 +198,16 @@ pub struct Options {
     /// the same transport; the caller owns resetting it if it wants per-request
     /// figures. Only the curl backend honors it.
     pub download_progress: Option<Arc<AtomicU64>>,
+    /// If set, the backend polls this flag while a request is in flight and
+    /// aborts the transfer as soon as it reads `true`, surfacing the request as
+    /// an [`std::io::ErrorKind::Interrupted`] I/O error. Unlike the
+    /// operation-level `should_interrupt` threaded through the fetch (checked
+    /// between reads by the protocol layer), this reaches time the transport
+    /// spends *blocked* — e.g. waiting on an idle or slow socket — so a caller
+    /// can cancel a stalled transfer promptly instead of waiting out
+    /// `low_speed_time`. Only the curl backend honors it (via its transfer
+    /// meter, which fires even while no bytes move).
+    pub should_interrupt: Option<Arc<AtomicBool>>,
 }
 
 impl Default for Options {
@@ -220,6 +230,7 @@ impl Default for Options {
             http_version: None,
             backend: None,
             download_progress: None,
+            should_interrupt: None,
         }
     }
 }

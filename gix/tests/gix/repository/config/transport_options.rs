@@ -59,6 +59,7 @@ mod http {
             http_version,
             backend,
             download_progress,
+            should_interrupt,
         } = http_options(&repo, None, "https://example.com/does/not/matter");
         assert_eq!(
             extra_headers,
@@ -83,6 +84,10 @@ mod http {
             "download-progress counters are provided by callers, never from configuration"
         );
         assert_eq!(ssl_ca_info.as_deref(), Some(std::path::Path::new("./CA.pem")));
+        assert!(
+            should_interrupt.is_none(),
+            "interrupt flags are provided by callers, never from configuration"
+        );
         #[cfg(feature = "blocking-http-transport-reqwest")]
         {
             assert!(
