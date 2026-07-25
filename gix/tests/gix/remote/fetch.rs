@@ -648,10 +648,10 @@ mod blocking_and_async_io {
     #[cfg_attr(feature = "async-network-client-async-std", async_std::test)]
     async fn fetch_pack_without_local_destination() -> crate::Result {
         let daemon = spawn_git_daemon_if_async(repo_path("clone-as-base-with-changes"))?;
-        for (fetch_tags, expected_pack_objects, num_objects_offset, expected_ref_edits) in [
-            (gix::remote::fetch::Tags::None, PACK_OBJECTS_WITHOUT_TAG, 0, 0),
-            (gix::remote::fetch::Tags::Included, PACK_OBJECTS_WITH_TAG, 1, 7),
-            (gix::remote::fetch::Tags::All, PACK_OBJECTS_WITH_TAG, 1, 7),
+        for (fetch_tags, expected_pack_objects, expected_ref_edits) in [
+            (gix::remote::fetch::Tags::None, PACK_OBJECTS_WITHOUT_TAG, 0),
+            (gix::remote::fetch::Tags::Included, PACK_OBJECTS_WITH_TAG, 7),
+            (gix::remote::fetch::Tags::All, PACK_OBJECTS_WITH_TAG, 7),
         ] {
             let (repo, _tmp) = repo_rw("two-origins");
             let mut remote = into_daemon_remote_if_async(
@@ -681,11 +681,6 @@ mod blocking_and_async_io {
                         pack_object_ids(write_pack_bundle.index_path.as_deref(), repo.object_hash()),
                         expected_pack_object_ids(expected_pack_objects),
                         "{fetch_tags:?}: the pack contains exactly the expected objects"
-                    );
-                    assert_eq!(
-                        write_pack_bundle.index.num_objects,
-                        3 + num_objects_offset,
-                        "{fetch_tags:?}"
                     );
                     assert!(
                         write_pack_bundle
@@ -820,17 +815,14 @@ mod blocking_and_async_io {
                         assert_eq!(write_pack_bundle.pack_version, gix::odb::pack::data::Version::V2);
                         assert_eq!(write_pack_bundle.object_hash, repo.object_hash());
                         assert_eq!(
-                            write_pack_bundle.index.num_objects, 4,
-                            "{dry_run}: this value is 4 when git does it with 'consecutive' negotiation style, but could be 33 if completely naive."
-                        );
-                        assert_eq!(
                             write_pack_bundle.index.index_version,
                             gix::odb::pack::index::Version::V2
                         );
                         assert_eq!(
                             pack_object_ids(write_pack_bundle.index_path.as_deref(), repo.object_hash()),
                             expected_pack_object_ids(PACK_OBJECTS_WITH_TAG),
-                            "{dry_run}: the pack contains exactly the expected objects"
+                            "{dry_run}: these 4 objects are what git sends with 'consecutive' negotiation style; \
+                             a completely naive negotiation would send 33"
                         );
                         assert!(write_pack_bundle.data_path.is_some_and(|f| f.is_file()));
                         assert!(write_pack_bundle.index_path.is_some_and(|f| f.is_file()));
