@@ -44,6 +44,17 @@ mod blocking_and_async_io {
         "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
     ];
 
+    /// Map SHA-1 hexes through [`hex_to_id`] — which substitutes SHA-256 ids during
+    /// `GIX_TEST_FIXTURE_HASH=sha256` runs — and sort the result.
+    ///
+    /// Sorting must happen *after* the mapping: ids sort by their raw bytes, so a list sorted in
+    /// SHA-1 space is generally not sorted in SHA-256 space.
+    pub(crate) fn expected_pack_object_ids(sha1_hexes: &[&str]) -> Vec<gix::ObjectId> {
+        let mut ids: Vec<_> = sha1_hexes.iter().copied().map(hex_to_id).collect();
+        ids.sort();
+        ids
+    }
+
     /// Return the sorted object ids of the pack whose index was written to `index_path`.
     ///
     /// Prefer this over asserting the pack's `data_hash`/`index_hash`: those cover the *compressed*
@@ -668,7 +679,7 @@ mod blocking_and_async_io {
                     assert_eq!(negotiate.rounds.len(), 1);
                     assert_eq!(
                         pack_object_ids(write_pack_bundle.index_path.as_deref(), repo.object_hash()),
-                        expected_pack_objects.iter().copied().map(hex_to_id).collect::<Vec<_>>(),
+                        expected_pack_object_ids(expected_pack_objects),
                         "{fetch_tags:?}: the pack contains exactly the expected objects"
                     );
                     assert_eq!(
@@ -818,7 +829,7 @@ mod blocking_and_async_io {
                         );
                         assert_eq!(
                             pack_object_ids(write_pack_bundle.index_path.as_deref(), repo.object_hash()),
-                            PACK_OBJECTS_WITH_TAG.iter().copied().map(hex_to_id).collect::<Vec<_>>(),
+                            expected_pack_object_ids(PACK_OBJECTS_WITH_TAG),
                             "{dry_run}: the pack contains exactly the expected objects"
                         );
                         assert!(write_pack_bundle.data_path.is_some_and(|f| f.is_file()));
